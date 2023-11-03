@@ -1,0 +1,69 @@
+1. załaduj pliki z katalogu input/ do hdfs
+	export BUCKET_NAME=pbd-2023-mmk
+	hadoop fs -mkdir -p projekt
+	hadoop fs -cp gs://$BUCKET_NAME/projekt/input projekt/
+	hadoop fs -cp gs://$BUCKET_NAME/projekt/mapper.py projekt/
+	hadoop fs -cp gs://$BUCKET_NAME/projekt/reducer.py projekt/
+
+2. w lokalnych plikach wgraj mapper.py i reducer.py
+	hadoop fs -copyToLocal projekt/mapper.py	
+	hadoop fs -copyToLocal projekt/reducer.py
+3. chmod +x *.py
+4. tr -d "\r" < mapper.py > mapper2.py
+4. tr -d "\r" < reducer.py > reducer2.py
+5. mapred streaming -files mapper2.py,reducer2.py -input projekt/input/datasource1/* -output output -mapper mapper2.py -reducer reducer2.py
+5.2. wyniki kopiujemy do locala hadoop fs -copyToLocal output/part-*
+6. odpalamy nową konsole
+7. beeline -n ${USER} -u jdbc:hive2://localhost:10000/default --silent
+	create database projekt;
+	use projekt;
+8. CREATE TABLE mapreduce_results (developerId INT, year INT, ratingsSum DOUBLE, ratingsCount INT, appsCount INT) row format delimited fields terminated by '\t' stored as textfile;
+9. !sh mkdir /tmp/source
+10. !sh mv part-00000 /tmp/source
+!sh mv part-00001 /tmp/source
+!sh mv part-00002 /tmp/source
+11. load data local inpath "/tmp/source/part-*" into table mapreduce_results;
+12. mamy wyniki mapreduce w naszej tabeli, teraz tworzymy tabele orc 
+	CREATE TABLE mapreduce_results_orc (developerId INT, year INT, ratingsSum DOUBLE, ratingsCount INT, appsCount INT) CLUSTERED BY (developerId, year) INTO 32 BUCKETS STORED AS ORC;
+13. przerzucamy se 
+	INSERT INTO mapreduce_results_orc SELECT * FROM mapreduce_results;
+14. teraz druga czesc datasource (na konsoli pierwszej)
+	hadoop fs -copyToLocal projekt/input/datasource4/part-00000
+15. !sh mv part-00000 /tmp/source
+16. tworzymy tabelke dla tego datasetu
+	CREATE TABLE developer_names (developerName STRING, website STRING, email STRING, developerId INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\u0001' STORED AS TEXTFILE;
+17. wrzucamy dane load data local inpath "tmp/source/part-00000" into table developer_names;
+18. tabela ale ORC:
+	CREATE TABLE developer_names_orc (developerName STRING, website STRING, email STRING, developerId INT) CLUSTERED BY (developerId) INTO 32 BUCKETS STORED AS ORC;
+19. INSERT INTO developer_names_orc SELECT * FROM developer_names WHERE developerName IS NOT NULL AND developerId IS NOT NULL;
+
+
+20. 
+WITH ranked_developers AS (
+    SELECT 
+        a.developerName AS developer_name, 
+        b.year, 
+        b.ratingsSum / b.ratingsCount AS avg_rate, 
+        b.appsCount AS count_apps, 
+        b.ratingsCount AS count_rates,
+        ROW_NUMBER() OVER (PARTITION BY b.year ORDER BY b.ratingsSum / b.ratingsCount DESC) AS rank
+    FROM 
+        developer_names_orc a
+    JOIN 
+        mapreduce_results_orc b 
+    ON 
+        a.developerId = b.developerId
+    WHERE 
+        a.developerName IS NOT NULL 
+        AND b.ratingsCount > 0
+)
+SELECT 
+    developer_name, 
+    year, 
+    avg_rate, 
+    count_apps, 
+    count_rates
+FROM 
+    ranked_developers
+WHERE 
+    rank <= 3;
